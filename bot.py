@@ -645,7 +645,7 @@ class Bot:
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S", stream=sys.stdout)
     a = parse_args()
     os.makedirs(a.data_dir, exist_ok=True)
     web.load_symbols(os.path.join(a.data_dir, "symbols.json"))
