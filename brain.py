@@ -89,8 +89,9 @@ class MLP:
 
 
 class Brain:
-    def __init__(self, path, nfeat, a, names):
+    def __init__(self, path, nfeat, a, names, label_version=1):
         self.path, self.a, self.names, self.nfeat = path, a, names, nfeat
+        self.label_version = label_version
         self.lock = threading.Lock()
         self.X = np.zeros((0, nfeat))
         self.y = np.zeros(0)
@@ -107,7 +108,7 @@ class Brain:
         self.mem_hist = []              # (время, примеров) для графика
         self.online_hist = []           # (время, ср. R отобранных, ср. R всех) для графика
         self.research = []              # таблица: сетап × ТФ на реальной истории
-        self.enabled = None             # {(ТФ, сетап)}, которые в плюсе; None — ещё не посчитано
+        self.enabled = None             # {(ТФ, сетап): запас стопа}, которые в плюсе; None — ещё не посчитано
         self._load()
 
     # ---------------------------------------------------------------- память
@@ -119,6 +120,8 @@ class Brain:
                 raise ValueError("другие признаки")
             with open(self.path + ".json", encoding="utf-8") as f:
                 st = json.load(f)
+            if st.get("label_version") != self.label_version:
+                raise ValueError("старая разметка исходов")
             if st.get("model"):
                 self.model = MLP(self.nfeat)
                 self.model.load(st["model"])
@@ -135,6 +138,7 @@ class Brain:
         with self.lock:
             X, y, t, real = self.X.copy(), self.y.copy(), self.t.copy(), self.real.copy()
             st = {"model": self.model.state() if self.model else None, "trained_until": self.trained_until,
+                  "label_version": self.label_version,
                   "online": self.online[-5000:], "val": self.val}
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -179,7 +183,7 @@ class Brain:
             return
         names = self.names
         ci = {n: k for k, n in enumerate(names)}
-        rows, enabled = [], set()
+        rows, enabled = [], {}
         for tf, col in ((1, "ТФ 1м"), (3, "ТФ 3м"), (5, "ТФ 5м")):
             for st in ("sweep", "retest", "pullback"):
                 m = (X[:, ci[col]] > 0.5) & (X[:, ci[st]] > 0.5)
@@ -201,7 +205,7 @@ class Brain:
                        "best_avg": best[1] if best else None}
                 row["on"] = bool(best and n >= self.a.research_min and best[1] > self.a.research_min_r)
                 if row["on"]:
-                    enabled.add((tf, st))
+                    enabled[(tf, st)] = best[0]
                 rows.append(row)
         rows.sort(key=lambda r: -(r["best_avg"] if r["best_avg"] is not None else -9))
         with self.lock:
@@ -304,5 +308,5 @@ class Brain:
                 "online": on, "val": self.val, "train_hist": self.train_hist[-60:],
                 "importance": self.importance, "thoughts": self.thoughts[-40:],
                 "mem_hist": self.mem_hist[-720:], "online_hist": self.online_hist[-720:],
-                "research": self.research, "enabled": sorted(self.enabled) if self.enabled is not None else None,
+                "research": self.research,
                 "last_train": self.last_train}

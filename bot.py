@@ -232,7 +232,8 @@ class Bot:
         self.inst = load_instruments(self.market)
         self.cd = Candles(self.market)
         self.st = State(os.path.join(a.data_dir, "state.json"), a)
-        self.brain = brain_mod.Brain(os.path.join(a.data_dir, "brain"), len(pa.FEAT_NAMES), a, pa.FEAT_NAMES)
+        self.brain = brain_mod.Brain(os.path.join(a.data_dir, "brain"), len(pa.FEAT_NAMES), a, pa.FEAT_NAMES,
+                                     pa.LABEL_VERSION)
         self.pending = []           # сетапы, ждущие исхода: {sym, t, plan, pred}
         self.universe, self.learn_set, self.uni_time, self.uni_info = [], [], 0.0, []
         self.signals = []           # последние сетапы для страницы
@@ -423,19 +424,30 @@ class Bot:
         for (sym, tf, setup, d), p in sorted(best.items(), key=lambda x: -x[1]["pred"]):
             take = sym in self.universe and p["pred"] >= self.a.min_edge
             note = ""
-            if take and enabled is not None and (tf, setup) not in enabled:
-                take, note = False, "этот сетап/ТФ в минусе на истории"
-            elif take and not ok:
+            if take and enabled is not None:
+                if (tf, setup) not in enabled:
+                    take, note = False, "этот сетап/ТФ в минусе на истории"
+                elif abs(p["buf"] - enabled[(tf, setup)]) > 1e-6:
+                    # сеть выбрала другой запас стопа — берём тот, что в плюсе на истории
+                    alt = [q for s_, q in fresh if s_ == sym and q["tf"] == tf and q["setup"] == setup
+                           and q["dir"] == d and abs(q["buf"] - enabled[(tf, setup)]) < 1e-6 and q.get("pred") is not None]
+                    if alt and alt[0]["pred"] >= self.a.min_edge:
+                        p = alt[0]
+                    else:
+                        take, note = False, f"с запасом {enabled[(tf, setup)]:g} ATR сеть ждёт мало"
+            if not take:
+                pass
+            elif not ok:
                 take, note = False, "сеть учится"
-            elif take and any(o["sym"] == sym for o in st.open):
+            elif any(o["sym"] == sym for o in st.open):
                 take, note = False, "уже в сделке"
-            elif take and len(st.open) >= self.a.max_open:
+            elif len(st.open) >= self.a.max_open:
                 take, note = False, f"уже {self.a.max_open} сделки"
-            elif take and st.day["r"] <= -self.a.day_loss_r:
+            elif st.day["r"] <= -self.a.day_loss_r:
                 take, note = False, "дневной лимит"
-            elif take and time.time() < st.pause_until:
+            elif time.time() < st.pause_until:
                 take, note = False, "пауза после серии стопов"
-            elif take and web.CONTROL["paused"]:
+            elif web.CONTROL["paused"]:
                 take, note = False, "на паузе"
             self.signals.append({"sym": sym, "tf": tf, "setup": setup, "dir": d, "pred": p["pred"],
                                  "risk_pct": p["risk"] / p["entry"] * 100, "buf": p["buf"], "room": p["room"],
@@ -612,7 +624,7 @@ class Bot:
             if m.any():
                 hi, lo = max(px, arr[m, 2].max()), min(px, arr[m, 3].min())
         if tr["status"] == "order":
-            if (lo <= tr["entry"]) if d > 0 else (hi >= tr["entry"]):
+            if (lo < tr["entry"] * (1 - pa.FILL_THROUGH)) if d > 0 else (hi > tr["entry"] * (1 + pa.FILL_THROUGH)):
                 tr.update(status="open", opened=time.time())
                 log.info("ВХОД %s (бумага): лимитка %.6g залилась", sym, tr["entry"])
                 self.st.save()

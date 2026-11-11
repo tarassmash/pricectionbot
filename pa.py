@@ -20,7 +20,9 @@ import numpy as np
 SETUPS = ("sweep", "retest", "pullback")
 # таймфреймы: старший ТФ для тренда, сколько баров держать сделку, сколько баров ждать заливки лимитки
 TFS = {1: {"htf": 5, "hold": 60, "wait": 3}, 3: {"htf": 15, "hold": 40, "wait": 1}, 5: {"htf": 15, "hold": 36, "wait": 1}}
-BUFFERS = (0.25, 0.5, 1.0)          # варианты запаса за экстремумом, × ATR — сеть выбирает лучший
+BUFFERS = (0.25, 0.5, 1.0)
+FILL_THROUGH = 0.0002               # лимитка считается залитой, если цена прошла сквозь неё на 0.02%
+LABEL_VERSION = 2                   # меняется, когда меняется разметка исходов — старая память стирается          # варианты запаса за экстремумом, × ATR — сеть выбирает лучший
 
 
 def ema(x, n):
@@ -258,7 +260,8 @@ def outcome(plan, h, l, c, start, hold, wait, maker_pct, taker_pct):
     d, entry, stop, tp, risk = plan["dir"], plan["entry"], plan["stop"], plan["tp"], plan["risk"]
     fill = None
     for k in range(start, min(len(c), start + wait)):
-        if (l[k] <= entry) if d > 0 else (h[k] >= entry):
+        # цена должна пройти СКВОЗЬ лимитку хотя бы на 0.02% — простого касания мало (очередь в стакане)
+        if (l[k] < entry * (1 - FILL_THROUGH)) if d > 0 else (h[k] > entry * (1 + FILL_THROUGH)):
             fill = k
             break
     if fill is None:
