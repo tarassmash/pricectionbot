@@ -48,7 +48,11 @@ def parse_args():
     p.add_argument("--loss-streak", type=int, default=4, help="столько стопов подряд — пауза --streak-pause мин")
     p.add_argument("--streak-pause", type=int, default=60)
     p.add_argument("--maker-pct", type=float, default=0.02, help="комиссия мейкера, %%")
-    p.add_argument("--slip-pct", type=float, default=0.03, help="проскальзывание входа и выхода по рынку, %% (в разметке)")
+    p.add_argument("--slip-pct", type=float, default=0.05, help="проскальзывание выхода догоняющей лимиткой, %% (в разметке)")
+    p.add_argument("--fee-mult", type=float, default=10, help="до стопа минимум X × комиссия туда-обратно")
+    p.add_argument("--chase-sec", type=float, default=12, help="сколько секунд догонять лимиткой вход")
+    p.add_argument("--chase-max-r", type=float, default=0.15, help="вход не дальше X R от цены сигнала")
+    p.add_argument("--backup-r", type=float, default=0.5, help="запасной стоп-лимит на бирже на X R дальше стопа бота")
     p.add_argument("--be-r", type=float, default=1.0, help="при +X R стоп в безубыток")
     p.add_argument("--trail-start", type=float, default=1.5, help="с +X R стоп тянется за ценой")
     p.add_argument("--trail-r", type=float, default=1.0, help="трейлинг: стоп в X R от лучшей цены")
@@ -469,15 +473,92 @@ class Bot:
                 self.enter(sym, p)
 
     # ------------------------------------------------ сделки
+    def book(self, sym):
+        ob = api(self.market.get_orderbook, category=CAT, symbol=sym, limit=1)["result"]
+        return float(ob["b"][0][0]), float(ob["a"][0][0])
+
+    def chase(self, sym, d, qty, reduce, seconds, cap_px=None):
+        """Догоняющая PostOnly-лимитка по лучшей цене стакана: каждые ~1.5 с переставляем, пока не зальётся,
+        не выйдет время или цена не уйдёт за cap_px. Только лимитки, без маркета. -> сколько исполнено."""
+        ins = self.inst[sym]
+        idx = self.mode(sym)
+        buy = (d > 0) != reduce              # вход в лонг / выход из шорта — покупка
+        side = "Buy" if buy else "Sell"
+        size0, _ = self.position(sym, d)
+        t_end = time.time() + seconds
+        done = 0.0
+        while time.time() < t_end and not STOP.is_set():
+            left = q_down(float(qty) - done, ins["step"])
+            if left < ins["min_qty"]:
+                break
+            bid, ask = self.book(sym)
+            px = bid if buy else ask
+            if cap_px is not None and ((buy and px > cap_px) or (not buy and px < cap_px)):
+                break
+            try:
+                r = api(self.s.place_order, category=CAT, symbol=sym, side=side, orderType="Limit", qty=str(left),
+                        price=str(q_price(px, ins["tick"])), timeInForce="PostOnly", reduceOnly=reduce,
+                        positionIdx=idx(d))
+                oid = r["result"].get("orderId")
+            except Exception as e:  # noqa: BLE001
+                log.info("%s: лимитка не встала: %s", sym, str(e)[:80])
+                time.sleep(0.5)
+                continue
+            time.sleep(1.5)
+            self.cancel(sym, oid)
+            size, _ = self.position(sym, d)
+            done = (size - size0) if not reduce else (size0 - size)
+            if reduce and size <= 0:
+                return float(qty)
+        return max(done, 0.0)
+
+    def exit_live(self, sym, d, size, urgent):
+        """Выход лимитками: догоняем по лучшей цене; если срочно (стоп) и не залилось за 6 с —
+        лимитка IOC через спред с потолком 0.3% (всё равно лимитка, не маркет)."""
+        self.chase(sym, d, size, True, 6 if urgent else 20)
+        size, _ = self.position(sym, d)
+        ins, idx = self.inst[sym], self.mode(sym)
+        for _ in range(8):
+            if size <= 0:
+                return True
+            bid, ask = self.book(sym)
+            px = (bid * (1 - 0.003)) if d > 0 else (ask * (1 + 0.003))
+            try:
+                api(self.s.place_order, category=CAT, symbol=sym, side="Sell" if d > 0 else "Buy", orderType="Limit",
+                    qty=str(q_down(size, ins["step"])), price=str(q_price(px, ins["tick"])), timeInForce="IOC",
+                    reduceOnly=True, positionIdx=idx(d))
+            except Exception as e:  # noqa: BLE001
+                log.info("%s: выход: %s", sym, str(e)[:80])
+            time.sleep(1.0)
+            size, _ = self.position(sym, d)
+        return size <= 0
+
+    def backup_stop(self, tr):
+        """Запасной стоп-ЛИМИТ на бирже чуть дальше стопа бота — сработает, только если бот не успел (упал)."""
+        sym, d, ins = tr["sym"], tr["dir"], self.inst[tr["sym"]]
+        risk0 = (tr["entry"] - tr["stop0"]) * d
+        trig = tr["stop"] - d * self.a.backup_r * risk0
+        lim = trig * (1 - d * 0.004)
+        try:
+            api(self.s.set_trading_stop, category=CAT, symbol=sym, tpslMode="Partial", positionIdx=self.mode(sym)(d),
+                stopLoss=str(q_price(trig, ins["tick"])), slTriggerBy="LastPrice", slOrderType="Limit",
+                slLimitPrice=str(q_price(lim, ins["tick"])), slSize=str(q_down(tr["qty"], ins["step"])))
+            tr["backup"] = trig
+        except Exception as e:  # noqa: BLE001
+            log.info("%s: запасной стоп-лимит не встал: %s", sym, str(e)[:100])
+
     def enter(self, sym, p):
-        """Вход сразу по рынку (IOC-лимитка через спред), стоп за структурой на бирже, дальше — трейлинг."""
+        """Вход догоняющей лимиткой (мейкер) по лучшей цене стакана; дальше стоп и трейлинг ведёт бот."""
         a, ins = self.a, self.inst[sym]
         bal = self.balance()
-        px = self.price(sym)
         d, tf = p["dir"], p["tf"]
+        cap = p["entry"] + d * a.chase_max_r * p["risk"]          # дальше этого не догоняем
+        px = self.price(sym)
+        if (px - cap) * d > 0:
+            log.info("%s: цена уже ушла дальше %.2fR от сигнала — пропускаю", sym, a.chase_max_r)
+            return
         risk = (px - p["stop"]) * d
-        if risk <= 0 or risk / px * 100 < a.min_risk_pct * 0.7:
-            log.info("%s: цена ушла к стопу (%.6g), вход отменён", sym, px)
+        if risk <= 0:
             return
         qty = min(bal * a.risk_pct / 100 / risk, bal * a.max_notional_x / px)
         qty = q_down(qty, ins["step"])
@@ -491,44 +572,35 @@ class Bot:
               "room": p["room"], "feats": p["feats"], "status": "open", "opened": time.time(), "placed": time.time(),
               "hold_min": cfg["hold"] * tf, "tp": None}
         if a.live:
-            idx = self.mode(sym)
             if sym not in self.lev_set:
                 lev = str(min(a.leverage, ins["max_lev"]))
                 api(self.s.set_leverage, category=CAT, symbol=sym, buyLeverage=lev, sellLeverage=lev)
                 self.lev_set.add(sym)
-            lim = q_price(px * (1 + 0.0015 * d), ins["tick"])
-            try:
-                api(self.s.place_order, category=CAT, symbol=sym, side="Buy" if d > 0 else "Sell", orderType="Limit",
-                    qty=str(qty), price=str(lim), timeInForce="IOC", positionIdx=idx(d))
-            except Exception as e:  # noqa: BLE001
-                log.info("%s: вход не прошёл: %s", sym, str(e)[:120])
-                return
-            time.sleep(1.0)
+            got = self.chase(sym, d, qty, False, a.chase_sec, cap)
             size, avg = self.position(sym, d)
-            if size <= 0:
-                log.info("%s: вход не исполнился (цена убежала)", sym)
+            if size <= 0 or got <= 0:
+                log.info("%s: лимитка на вход не залилась за %g с — пропускаю", sym, a.chase_sec)
                 return
             tr.update(qty=size, entry=avg or px)
             if (tr["entry"] - tr["stop"]) * d <= 0:
                 log.info("%s: цена уже за стопом — выхожу", sym)
-                self.close_live(sym, d, size)
+                self.exit_live(sym, d, size, True)
                 return
-            api(self.s.set_trading_stop, category=CAT, symbol=sym, tpslMode="Full", positionIdx=idx(d),
-                stopLoss=str(q_price(tr["stop"], ins["tick"])), slTriggerBy="LastPrice")
+            self.backup_stop(tr)
         else:
-            tr["entry"] = px * (1 + a.slip_pct / 100 * d)
+            tr["entry"] = p["entry"] if (px - p["entry"]) * d <= 0 else px     # бумага: лимитка по лучшей цене
         tr["risk_usd"] = (tr["entry"] - tr["stop"]) * d * tr["qty"]
         tr["best"] = tr["entry"]
         tr["last_check"] = time.time()
         self.st.open.append(tr)
         self.st.save()
-        log.info("ВХОД %s %s %s %dм: %s @ %.6g, стоп %.6g, риск %.2f$, дальше трейлинг (сеть ждёт %+.2fR)",
+        log.info("ВХОД %s %s %s %dм: %s @ %.6g лимиткой, стоп %.6g, риск %.2f$, дальше трейлинг (сеть ждёт %+.2fR)",
                  sym, "ЛОНГ" if d > 0 else "ШОРТ", p["setup"], tf, tr["qty"], tr["entry"], tr["stop"], tr["risk_usd"],
                  p["pred"])
         self.brain.think("trade", f"Вхожу: {sym} {'лонг' if d > 0 else 'шорт'} ({p['setup']}, {tf}м)", [
-            f"Вход {tr['entry']:.6g} по рынку, стоп {tr['stop']:.6g} (за структурой + {p['buf']:g} ATR), риск {tr['risk_usd']:.2f}$",
+            f"Вход {tr['entry']:.6g} лимиткой, стоп {tr['stop']:.6g} (за структурой + {p['buf']:g} ATR), риск {tr['risk_usd']:.2f}$",
             f"При +{a.be_r:g}R — безубыток, с +{a.trail_start:g}R стоп тянется в {a.trail_r:g}R за ценой; "
-            f"нет +{a.stale_r:g}R за {a.stale_bars} баров — выхожу",
+            f"нет +{a.stale_r:g}R за {a.stale_bars} баров — выхожу; выход тоже лимиткой",
             f"Жду {p['pred']:+.2f}R; до встречного уровня {p['room']:.1f}R"])
 
     def balance(self):
@@ -560,6 +632,9 @@ class Bot:
         return 0.0, 0.0
 
     def close_live(self, sym, d, size):
+        return self.exit_live(sym, d, size, True)
+
+    def _close_live_old(self, sym, d, size):
         ins = self.inst[sym]
         idx = self.mode(sym)
         for _ in range(6):
@@ -624,29 +699,31 @@ class Bot:
         return bars >= self.a.stale_bars and (tr["best"] - tr["entry"]) * d < self.a.stale_r * risk0
 
     def manage_live(self, tr):
-        sym, d, ins = tr["sym"], tr["dir"], self.inst[tr["sym"]]
+        sym, d = tr["sym"], tr["dir"]
         size, _ = self.position(sym, d)
         if size <= 0:
             self.finish_live(tr)
             return
         px = self.price(sym)
         hi, lo = self._extremes(tr, px)
-        new = self._trail(tr, hi, lo)
-        if (new - tr["stop"]) * d >= float(ins["tick"]):
-            try:
-                api(self.s.set_trading_stop, category=CAT, symbol=sym, tpslMode="Full", positionIdx=self.mode(sym)(d),
-                    stopLoss=str(q_price(new, ins["tick"])), slTriggerBy="LastPrice")
-                log.info("%s: стоп подтянут %.6g → %.6g", sym, tr["stop"], new)
-                tr["stop"] = float(q_price(new, ins["tick"]))
+        why = None
+        if (lo <= tr["stop"]) if d > 0 else (hi >= tr["stop"]):            # стоп бота — выходим лимитками
+            why = self._why(tr, tr["stop"])
+        else:
+            new = self._trail(tr, hi, lo)
+            if (new - tr["stop"]) * d > 0:
+                tr["stop"] = new
+                risk0 = (tr["entry"] - tr["stop0"]) * d
+                if (new - tr.get("backup", tr["stop0"])) * d > 0.5 * risk0 + self.a.backup_r * risk0:
+                    self.backup_stop(tr)                                       # подтягиваем запасной стоп-лимит
                 self.st.save()
-            except Exception as e:  # noqa: BLE001
-                log.info("%s: стоп не подтянулся: %s", sym, str(e)[:100])
-        if self._stale(tr):
-            self.close_live(sym, d, size)
-            self.finish_live(tr, "без движения")
-        elif time.time() - tr["opened"] > tr["hold_min"] * 60:
-            self.close_live(sym, d, size)
-            self.finish_live(tr, "время")
+            if self._stale(tr):
+                why = "без движения"
+            elif time.time() - tr["opened"] > tr["hold_min"] * 60:
+                why = "время"
+        if why:
+            self.exit_live(sym, d, size, why in ("стоп", "безубыток", "трейлинг"))
+            self.finish_live(tr, why)
 
     def manage_paper(self, tr):
         d = tr["dir"]
@@ -672,7 +749,7 @@ class Bot:
 
     def finish_paper(self, tr, exit_px, why):
         d = tr["dir"]
-        fee = (tr["entry"] + exit_px) * self.a.taker_pct * tr["qty"] / 100
+        fee = (tr["entry"] + exit_px) * self.a.maker_pct * tr["qty"] / 100
         pnl = (exit_px - tr["entry"]) * d * tr["qty"] - fee
         self.st.paper_balance += pnl
         self.record(tr, exit_px, pnl, why)

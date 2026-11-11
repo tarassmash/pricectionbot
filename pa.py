@@ -22,7 +22,7 @@ SETUPS = ("sweep", "retest", "pullback")
 TFS = {1: {"htf": 5, "hold": 60, "wait": 3}, 3: {"htf": 15, "hold": 40, "wait": 1}, 5: {"htf": 15, "hold": 36, "wait": 1}}
 BUFFERS = (0.25, 0.5, 1.0)
 FILL_THROUGH = 0.0002               # лимитка считается залитой, если цена прошла сквозь неё на 0.02%
-LABEL_VERSION = 3                   # меняется, когда меняется разметка исходов — старая память стирается          # варианты запаса за экстремумом, × ATR — сеть выбирает лучший
+LABEL_VERSION = 4                   # меняется, когда меняется разметка исходов — старая память стирается          # варианты запаса за экстремумом, × ATR — сеть выбирает лучший
 
 
 def ema(x, n):
@@ -214,7 +214,9 @@ def plans(cx, a, i=None):
                 continue
             risk_atr = risk / at
             risk_pct = risk / entry * 100
-            if not (a.min_risk_atr <= risk_atr <= a.max_risk_atr) or risk_pct < a.min_risk_pct:
+            # до стопа минимум fee_mult × комиссия туда-обратно — иначе комиссии съедят сделку
+            min_pct = max(a.min_risk_pct, a.fee_mult * 2 * a.maker_pct)
+            if not (a.min_risk_atr <= risk_atr <= a.max_risk_atr) or risk_pct < min_pct:
                 continue
             room = _room(cx, i, d, entry, risk)
             if room < a.min_room:
@@ -265,12 +267,13 @@ def trail_stop(d, entry, risk, stop, best, a):
 
 
 def outcome(plan, h, l, c, start, hold, a):
-    """Исход сделки со входом по рынку на открытии бара start (≈ цена сигнала) и выходом по трейлингу.
+    """Исход сделки со входом лимиткой по цене сигнала в начале бара start (≈ цена сигнала) и выходом по трейлингу.
     В каждом баре сначала проверяем стоп (с тем стопом, что стоял до бара), потом двигаем стоп по максимуму бара.
     Без движения: за a.stale_bars баров не дошли до +stale_r R — выходим по закрытию (режем убыток).
-    Комиссии — тейкер на вход и выход. -> (R, баров, итог) или None, если баров ещё не хватает."""
+    Комиссии — мейкер на вход и выход (лимитки) + проскальзывание выхода. -> (R, баров, итог) или None, если баров ещё не хватает."""
     d, entry, stop, risk = plan["dir"], plan["entry"], plan["stop"], plan["risk"]
-    fee_r = 2 * a.taker_pct / 100 * entry / risk + a.slip_pct / 100 * entry / risk
+    # только лимитки: мейкер на вход и выход + проскальзывание догоняющей лимитки на выходе
+    fee_r = (2 * a.maker_pct + a.slip_pct) / 100 * entry / risk
     best = entry
     end = min(len(c), start + hold)
     for k in range(start, end):

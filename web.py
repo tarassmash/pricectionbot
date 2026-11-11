@@ -180,8 +180,8 @@ def render():
                     '<th>Дошли до +1R</th><th>Торговать</th></tr>'
                     + (rows or '<tr><td colspan="8" class="muted">Посчитаю после первого обучения</td></tr>') + "</table></div>"
                     f'<p class="muted small">Торгую сочетание, если на лучшем запасе стопа в среднем больше +{a.research_min_r:g}R '
-                    f'на {a.research_min}+ сетапах. Вход по рынку, выход: стоп за структурой, безубыток при +{a.be_r:g}R, трейлинг {a.trail_r:g}R '
-                    f'с +{a.trail_start:g}R, нет +{a.stale_r:g}R за {a.stale_bars} баров — выход. Комиссии тейкера и проскальзывание учтены.</p></div>')
+                    f'на {a.research_min}+ сетапах. Только лимитки (мейкер), без маркета; до стопа ≥ {a.fee_mult:g}× комиссии. Выход: стоп за структурой, безубыток при +{a.be_r:g}R, трейлинг {a.trail_r:g}R '
+                    f'с +{a.trail_start:g}R, нет +{a.stale_r:g}R за {a.stale_bars} баров — выход. Комиссии мейкера и проскальзывание учтены.</p></div>')
         # сигналы этой минуты
         rows = "".join(
             f'<tr><td>{escape(x["sym"])}</td><td>{escape(x["setup"])} {x.get("tf", 1)}м {"↑" if x["dir"] > 0 else "↓"}</td>'
