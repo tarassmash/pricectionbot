@@ -95,6 +95,14 @@ def spark(series, w=520, h=120, colors=("#2a78d6", "#898781"), zero=False, fmt="
     return "".join(out)
 
 
+def bufs(r):
+    return "—" if r.get("best_buf") is None else f'{r["best_buf"]:g} ATR'
+
+
+def bavg(r):
+    return "—" if r.get("best_avg") is None else f'{r["best_avg"]:+.3f}R'
+
+
 def tm(ts):
     return time.strftime("%d.%m %H:%M", time.gmtime(ts)) if ts else "—"
 
@@ -142,14 +150,30 @@ def render():
         # открытые сделки
         rows = "".join(
             f'<tr><td>{escape(o["sym"])}</td><td class="{"pos" if o["dir"] > 0 else "neg"}">{"лонг" if o["dir"] > 0 else "шорт"}</td>'
-            f'<td>{escape(o["setup"])}</td><td>{o["entry"]:.6g}</td><td>{o["stop"]:.6g}</td><td>{o["tp"]:.6g}</td>'
-            f'<td>{o.get("risk_usd", 0):.2f}$</td><td>{int((time.time() - o["opened"]) / 60)} мин</td></tr>' for o in st.open)
-        body.append('<div class="panel"><h2>Открытые сделки</h2><div class="scroll"><table><tr><th>Монета</th><th></th>'
-                    '<th>Сетап</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Риск</th><th>Идёт</th></tr>'
-                    + (rows or '<tr><td colspan="8" class="muted">Нет</td></tr>') + "</table></div></div>")
+            f'<td>{escape(o["setup"])} {o.get("tf", 1)}м</td><td>{"ждёт заливки" if o.get("status") == "order" else "в позиции"}</td>'
+            f'<td>{o["entry"]:.6g}</td><td>{o["stop"]:.6g}</td><td>{o["tp"]:.6g}</td>'
+            f'<td>{o.get("risk_usd", 0):.2f}$</td><td>{int((time.time() - o.get("opened", o.get("placed", time.time()))) / 60)} мин</td></tr>'
+            for o in st.open)
+        body.append('<div class="panel"><h2>Открытые сделки и лимитки</h2><div class="scroll"><table><tr><th>Монета</th><th></th>'
+                    '<th>Сетап</th><th>Статус</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Риск</th><th>Идёт</th></tr>'
+                    + (rows or '<tr><td colspan="9" class="muted">Нет</td></tr>') + "</table></div></div>")
+        # исследование: какие сетапы реально в плюсе
+        rs = br.get("research") or []
+        rows = "".join(
+            f'<tr><td>{escape(r["setup"])}</td><td>{r["tf"]}м</td><td>{r["n"]:,}</td>'
+            f'<td class="{"pos" if r["avg"] > 0 else "neg"}">{r["avg"]:+.3f}R</td>'
+            f'<td>{bufs(r)}</td><td class="{"pos" if (r["best_avg"] or 0) > 0 else "neg"}">{bavg(r)}</td>'
+            f'<td>{r["tp"]:.0%}</td><td>{r["fill"]:.0%}</td><td class="{"pos" if r["on"] else "muted"}">{"торгую" if r["on"] else "нет"}</td></tr>'
+            for r in rs)
+        body.append('<div class="panel"><h2>Какие сетапы в плюсе (реальная история, с комиссиями)</h2><div class="scroll"><table>'
+                    '<tr><th>Сетап</th><th>ТФ</th><th>Сетапов</th><th>Средний R</th><th>Лучший запас стопа</th><th>R с ним</th>'
+                    '<th>Тейков</th><th>Заливка лимитки</th><th>Торговать</th></tr>'
+                    + (rows or '<tr><td colspan="9" class="muted">Посчитаю после первого обучения</td></tr>') + "</table></div>"
+                    f'<p class="muted small">Торгую сочетание, если на лучшем запасе стопа в среднем больше +{a.research_min_r:g}R '
+                    f'на {a.research_min}+ сетапах. «Средний R» — на каждый сигнал, включая не залитые лимитки (0R).</p></div>')
         # сигналы этой минуты
         rows = "".join(
-            f'<tr><td>{escape(x["sym"])}</td><td>{escape(x["setup"])} {"↑" if x["dir"] > 0 else "↓"}</td>'
+            f'<tr><td>{escape(x["sym"])}</td><td>{escape(x["setup"])} {x.get("tf", 1)}м {"↑" if x["dir"] > 0 else "↓"}</td>'
             f'<td class="{"pos" if x["pred"] >= 0 else "neg"}">{x["pred"]:+.2f}R</td><td>{x["risk_pct"]:.2f}%</td>'
             f'<td>{x["buf"]:g} ATR</td><td>{min(x["room"], 9):.1f}R</td>'
             f'<td class="{"pos" if x["take"] else "muted"}">{escape(x["note"])}</td></tr>' for x in b.signals[:15])
@@ -198,7 +222,7 @@ def render():
                     + (vol or '<tr><td colspan="4" class="muted">—</td></tr>') + "</table></div></div>")
         # закрытые сделки
         rows = "".join(
-            f'<tr><td>{tm(x["closed"])}</td><td>{escape(x["sym"])}</td><td>{"лонг" if x["dir"] > 0 else "шорт"} · {escape(x["setup"])}</td>'
+            f'<tr><td>{tm(x["closed"])}</td><td>{escape(x["sym"])}</td><td>{"лонг" if x["dir"] > 0 else "шорт"} · {escape(x["setup"])} {x.get("tf", 1)}м</td>'
             f'<td>{escape(x["why"])}</td><td class="{"pos" if x["r"] > 0 else "neg"}">{x["r"]:+.2f}R</td>'
             f'<td class="{"pos" if x["pnl"] > 0 else "neg"}">{x["pnl"]:+.2f}$</td><td>{x["pred"]:+.2f}R</td></tr>'
             for x in reversed(closed[-40:]))

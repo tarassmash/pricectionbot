@@ -106,6 +106,8 @@ class Brain:
         self.thoughts = []              # журнал «мыслей» для страницы
         self.mem_hist = []              # (время, примеров) для графика
         self.online_hist = []           # (время, ср. R отобранных, ср. R всех) для графика
+        self.research = []              # таблица: сетап × ТФ на реальной истории
+        self.enabled = None             # {(ТФ, сетап)}, которые в плюсе; None — ещё не посчитано
         self._load()
 
     # ---------------------------------------------------------------- память
@@ -167,6 +169,48 @@ class Brain:
         self.thoughts.append({"time": time.time(), "kind": kind, "title": title, "lines": list(lines)})
         self.thoughts = self.thoughts[-60:]
 
+    # ---------------------------------------------------------------- исследование: какие сетапы в плюсе
+    def do_research(self):
+        """По всей памяти (реальная история рынка): средний R каждого сетапа на каждом ТФ и по каждому
+        запасу стопа. Торгуются только сочетания, где лучший запас стопа в среднем > --research-min-r."""
+        with self.lock:
+            X, y = self.X.copy(), self.y.copy()
+        if not len(y):
+            return
+        names = self.names
+        ci = {n: k for k, n in enumerate(names)}
+        rows, enabled = [], set()
+        for tf, col in ((1, "ТФ 1м"), (3, "ТФ 3м"), (5, "ТФ 5м")):
+            for st in ("sweep", "retest", "pullback"):
+                m = (X[:, ci[col]] > 0.5) & (X[:, ci[st]] > 0.5)
+                n = int(m.sum())
+                if not n:
+                    continue
+                yy, buf = y[m], X[m, ci["запас стопа"]]
+                best = None
+                for b in np.unique(np.round(buf, 2)):
+                    mb = np.abs(buf - b) < 1e-6
+                    if mb.sum() >= max(20, self.a.research_min // 3):
+                        v = float(yy[mb].mean())
+                        if best is None or v > best[1]:
+                            best = (float(b), v, int(mb.sum()))
+                filled = yy[yy != 0]
+                row = {"tf": tf, "setup": st, "n": n, "avg": float(yy.mean()),
+                       "tp": float((filled > 1).mean()) if len(filled) else 0.0,
+                       "fill": float(len(filled) / n), "best_buf": best[0] if best else None,
+                       "best_avg": best[1] if best else None}
+                row["on"] = bool(best and n >= self.a.research_min and best[1] > self.a.research_min_r)
+                if row["on"]:
+                    enabled.add((tf, st))
+                rows.append(row)
+        rows.sort(key=lambda r: -(r["best_avg"] if r["best_avg"] is not None else -9))
+        with self.lock:
+            self.research, self.enabled = rows, enabled
+        self.think("research", "Посчитала сетапы на истории", [
+            f"{r['setup']} {r['tf']}м: {r['n']} сетапов, в среднем {r['avg']:+.2f}R, лучший запас стопа "
+            f"{r['best_buf']} ATR → {r['best_avg']:+.2f}R, тейков {r['tp']:.0%}, заливка {r['fill']:.0%}"
+            + (" — ТОРГУЮ" if r["on"] else " — не торгую") for r in rows if r["best_avg"] is not None])
+
     # ---------------------------------------------------------------- обучение
     def train(self, log=None):
         with self.lock:
@@ -174,6 +218,7 @@ class Brain:
         if len(y) < self.a.min_samples:
             self.think("train", "Мало примеров для обучения", [f"{len(y)} из {self.a.min_samples}"])
             return False
+        self.do_research()
         order = np.argsort(t)
         X, y, t, real = X[order], y[order], t[order], real[order]
         cut = int(len(y) * 0.8)
@@ -259,4 +304,5 @@ class Brain:
                 "online": on, "val": self.val, "train_hist": self.train_hist[-60:],
                 "importance": self.importance, "thoughts": self.thoughts[-40:],
                 "mem_hist": self.mem_hist[-720:], "online_hist": self.online_hist[-720:],
+                "research": self.research, "enabled": sorted(self.enabled) if self.enabled is not None else None,
                 "last_train": self.last_train}

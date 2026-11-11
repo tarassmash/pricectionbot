@@ -18,6 +18,8 @@ import math
 import numpy as np
 
 SETUPS = ("sweep", "retest", "pullback")
+# таймфреймы: старший ТФ для тренда, сколько баров держать сделку, сколько баров ждать заливки лимитки
+TFS = {1: {"htf": 5, "hold": 60, "wait": 3}, 3: {"htf": 15, "hold": 40, "wait": 1}, 5: {"htf": 15, "hold": 36, "wait": 1}}
 BUFFERS = (0.25, 0.5, 1.0)          # варианты запаса за экстремумом, × ATR — сеть выбирает лучший
 
 
@@ -48,6 +50,25 @@ def swings(h, l, k=3):
     return sh, sl
 
 
+def aggregate(arr, tf):
+    """Минутки [[t,o,h,l,c,v],...] -> закрытые свечи tf минут (неполная последняя отбрасывается)."""
+    if tf == 1 or not len(arr):
+        return arr
+    g = (arr[:, 0] // (tf * 60_000)).astype(np.int64)
+    idx = np.flatnonzero(np.diff(g)) + 1
+    starts = np.concatenate([[0], idx])
+    ends = np.concatenate([idx, [len(arr)]])
+    full = (ends - starts) == tf
+    full[-1] = full[-1] and (arr[-1, 0] // 60_000 + 1) % tf == 0
+    if not full[0]:                      # первая группа могла начаться не с начала бара
+        full[0] = (arr[0, 0] // 60_000) % tf == 0 and ends[0] - starts[0] == tf
+    out = np.empty((len(starts), 6))
+    for k, (a_, b_) in enumerate(zip(starts, ends)):
+        seg = arr[a_:b_]
+        out[k] = (g[a_] * tf * 60_000, seg[0, 1], seg[:, 2].max(), seg[:, 3].min(), seg[-1, 4], seg[:, 5].sum())
+    return out[full]
+
+
 def er(c, n):
     """Efficiency ratio за n свечей: 0 — боковик, 1 — прямая."""
     if len(c) <= n:
@@ -60,8 +81,11 @@ def er(c, n):
 class Ctx:
     """Всё, что нужно сетапам и признакам, считается один раз на свечи монеты."""
 
-    def __init__(self, t, o, h, l, c, v, btc=None):
-        """btc — {время свечи (мс): close BTC} для контекста рынка (движение BTC за 15 мин)."""
+    def __init__(self, t, o, h, l, c, v, btc=None, tf=1):
+        """btc — {время минутки (мс): close BTC} для контекста рынка (движение BTC за 15 мин);
+        tf — таймфрейм свечей в минутах (тренд берётся со старшего ТФ из TFS)."""
+        self.tf = tf
+        htf_ms = TFS[tf]["htf"] * 60_000
         self.t, self.o, self.h, self.l, self.c, self.v = t, o, h, l, c, v
         self.n = len(c)
         self.atr = atr(h, l, c, 14)
@@ -69,7 +93,7 @@ class Ctx:
         self.ema20 = ema(c, 20)
         self.sh, self.sl = swings(h, l, 3)
         # тренд 5м на каждую минуту — только по уже закрытым 5-минуткам (без заглядывания вперёд)
-        g = (t // 300_000).astype(np.int64)
+        g = (t // htf_ms).astype(np.int64)
         idx = np.flatnonzero(np.diff(g)) + 1
         ends = np.concatenate([idx, [len(t)]])
         C5 = c[ends - 1]
@@ -87,8 +111,9 @@ class Ctx:
             self.trend_a[i] = 1 if (e20[k] > e50[k] and sl > 0.05) else (-1 if (e20[k] < e50[k] and sl < -0.05) else 0)
         self.btc_a = np.zeros(self.n)
         if btc:
+            sh = (tf - 1) * 60_000            # последняя минутка внутри бара
             for i in range(self.n):
-                b0, b1 = btc.get(int(t[i])), btc.get(int(t[i]) - 15 * 60_000)
+                b0, b1 = btc.get(int(t[i]) + sh), btc.get(int(t[i]) + sh - 15 * 60_000)
                 if b0 and b1:
                     self.btc_a[i] = (b0 / b1 - 1) * 100
 
@@ -193,7 +218,7 @@ def plans(cx, a, i=None):
             if room < a.min_room:
                 continue
             tp = entry + d * a.rr * risk
-            res.append({"setup": setup, "dir": d, "entry": entry, "stop": float(stop), "tp": float(tp),
+            res.append({"setup": setup, "dir": d, "entry": entry, "tf": cx.tf, "stop": float(stop), "tp": float(tp),
                         "risk": float(risk), "buf": buf, "room": float(room), "i": i,
                         "feats": features(cx, i, setup, d, risk, buf, room, extra, a)})
     return res
@@ -203,7 +228,7 @@ FEAT_NAMES = ["sweep", "retest", "pullback", "по тренду 5м", "прот�
               "запас стопа", "место до уровня, R", "хвост сигнальной", "тело сигнальной", "объём к среднему",
               "волатильность, %", "ATR к часовому", "боковик 20м (ER)", "наклон 5м", "от EMA20, ATR",
               "глубина прокола/отбоя", "возраст уровня", "движение за 15м, %", "BTC за 15м, %", "час (sin)",
-              "час (cos)", "лонг"]
+              "час (cos)", "лонг", "ТФ 1м", "ТФ 3м", "ТФ 5м"]
 
 
 def features(cx, i, setup, d, risk, buf, room, extra, a):
@@ -212,7 +237,7 @@ def features(cx, i, setup, d, risk, buf, room, extra, a):
     rng = max(h - l, 1e-12)
     wick = (h - max(o, c)) / rng if d < 0 else (min(o, c) - l) / rng
     vavg = cx.v[max(0, i - 20):i].mean() if i > 0 else v
-    move15 = (c / cx.c[max(0, i - 15)] - 1) * 100 * d
+    move15 = (c / cx.c[max(0, i - max(1, 15 // cx.tf))] - 1) * 100 * d
     hr = (cx.t[i] // 3_600_000) % 24
     return [
         float(setup == "sweep"), float(setup == "retest"), float(setup == "pullback"),
@@ -221,23 +246,34 @@ def features(cx, i, setup, d, risk, buf, room, extra, a):
         at / max(cx.atr60[i], 1e-12), er(cx.c[:i + 1], 20), cx.slope_a[i] * d, (c - cx.ema20[i]) / at * d,
         min(extra.get("depth", 0.0), 5.0), min(extra.get("lvl_age", 0) / 60.0, 2.0), move15,
         cx.btc_a[i] * d, math.sin(hr / 24 * 2 * math.pi), math.cos(hr / 24 * 2 * math.pi), float(d > 0),
+        float(cx.tf == 1), float(cx.tf == 3), float(cx.tf == 5),
     ]
 
 
-def outcome(plan, h, l, c, start, max_hold, fee_pct):
-    """Исход сделки на свечах после сигнала (h,l,c — массивы, start — индекс первой свечи после входа).
-    Если в одной свече задеты и стоп, и тейк — считаем стоп (осторожно). -> (R с комиссиями, свечей, итог)
-    или None, если свечей ещё не хватает."""
+def outcome(plan, h, l, c, start, hold, wait, maker_pct, taker_pct):
+    """Исход сделки с входом ЛИМИТКОЙ по цене сигнала (h,l,c — массивы ТФ сделки, start — первый бар после сигнала).
+    Лимитка ждёт `wait` баров: не дошла цена — сделки нет (0R). После заливки: тейк — лимитка (мейкер),
+    стоп и выход по времени — по рынку (тейкер). Если в одном баре и стоп, и тейк — считаем стоп.
+    -> (R с комиссиями, баров, итог) или None, если баров ещё не хватает."""
     d, entry, stop, tp, risk = plan["dir"], plan["entry"], plan["stop"], plan["tp"], plan["risk"]
-    fee_r = fee_pct / 100 * 2 * entry / risk
-    end = min(len(c), start + max_hold)
-    for k in range(start, end):
+    fill = None
+    for k in range(start, min(len(c), start + wait)):
+        if (l[k] <= entry) if d > 0 else (h[k] >= entry):
+            fill = k
+            break
+    if fill is None:
+        if len(c) - start < wait:
+            return None
+        return 0.0, wait, "не залилась"
+    per = entry / risk / 100
+    end = min(len(c), fill + hold)
+    for k in range(fill, end):
         hit_sl = l[k] <= stop if d > 0 else h[k] >= stop
         hit_tp = h[k] >= tp if d > 0 else l[k] <= tp
         if hit_sl:
-            return -1.0 - fee_r, k - start + 1, "стоп"
-        if hit_tp:
-            return (tp - entry) * d / risk - fee_r, k - start + 1, "тейк"
-    if end - start < max_hold:
+            return -1.0 - (maker_pct + taker_pct) * per, k - start + 1, "стоп"
+        if hit_tp and k > fill:          # на баре заливки тейк не считаем — неизвестно, что было раньше
+            return (tp - entry) * d / risk - 2 * maker_pct * per, k - start + 1, "тейк"
+    if end - fill < hold:
         return None
-    return (c[end - 1] - entry) * d / risk - fee_r, max_hold, "время"
+    return (c[end - 1] - entry) * d / risk - (maker_pct + taker_pct) * per, end - start, "время"
