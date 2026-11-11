@@ -22,7 +22,7 @@ SETUPS = ("sweep", "retest", "pullback")
 TFS = {1: {"htf": 5, "hold": 60, "wait": 3}, 3: {"htf": 15, "hold": 40, "wait": 1}, 5: {"htf": 15, "hold": 36, "wait": 1}}
 BUFFERS = (0.25, 0.5, 1.0)
 FILL_THROUGH = 0.0002               # лимитка считается залитой, если цена прошла сквозь неё на 0.02%
-LABEL_VERSION = 2                   # меняется, когда меняется разметка исходов — старая память стирается          # варианты запаса за экстремумом, × ATR — сеть выбирает лучший
+LABEL_VERSION = 3                   # меняется, когда меняется разметка исходов — старая память стирается          # варианты запаса за экстремумом, × ATR — сеть выбирает лучший
 
 
 def ema(x, n):
@@ -219,7 +219,7 @@ def plans(cx, a, i=None):
             room = _room(cx, i, d, entry, risk)
             if room < a.min_room:
                 continue
-            tp = entry + d * a.rr * risk
+            tp = entry + d * a.rr * risk          # ориентир (выход — по трейлингу)
             res.append({"setup": setup, "dir": d, "entry": entry, "tf": cx.tf, "stop": float(stop), "tp": float(tp),
                         "risk": float(risk), "buf": buf, "room": float(room), "i": i,
                         "feats": features(cx, i, setup, d, risk, buf, room, extra, a)})
@@ -252,31 +252,35 @@ def features(cx, i, setup, d, risk, buf, room, extra, a):
     ]
 
 
-def outcome(plan, h, l, c, start, hold, wait, maker_pct, taker_pct):
-    """Исход сделки с входом ЛИМИТКОЙ по цене сигнала (h,l,c — массивы ТФ сделки, start — первый бар после сигнала).
-    Лимитка ждёт `wait` баров: не дошла цена — сделки нет (0R). После заливки: тейк — лимитка (мейкер),
-    стоп и выход по времени — по рынку (тейкер). Если в одном баре и стоп, и тейк — считаем стоп.
-    -> (R с комиссиями, баров, итог) или None, если баров ещё не хватает."""
-    d, entry, stop, tp, risk = plan["dir"], plan["entry"], plan["stop"], plan["tp"], plan["risk"]
-    fill = None
-    for k in range(start, min(len(c), start + wait)):
-        # цена должна пройти СКВОЗЬ лимитку хотя бы на 0.02% — простого касания мало (очередь в стакане)
-        if (l[k] < entry * (1 - FILL_THROUGH)) if d > 0 else (h[k] > entry * (1 + FILL_THROUGH)):
-            fill = k
-            break
-    if fill is None:
-        if len(c) - start < wait:
-            return None
-        return 0.0, wait, "не залилась"
-    per = entry / risk / 100
-    end = min(len(c), fill + hold)
-    for k in range(fill, end):
-        hit_sl = l[k] <= stop if d > 0 else h[k] >= stop
-        hit_tp = h[k] >= tp if d > 0 else l[k] <= tp
-        if hit_sl:
-            return -1.0 - (maker_pct + taker_pct) * per, k - start + 1, "стоп"
-        if hit_tp and k > fill:          # на баре заливки тейк не считаем — неизвестно, что было раньше
-            return (tp - entry) * d / risk - 2 * maker_pct * per, k - start + 1, "тейк"
-    if end - fill < hold:
+def trail_stop(d, entry, risk, stop, best, a):
+    """Новый стоп по ходу сделки: безубыток при +be_r R, трейлинг trail_r R от лучшей цены с +trail_start R."""
+    fav = (best - entry) * d / risk
+    if fav >= a.be_r:
+        be = entry + d * 0.1 * risk                      # безубыток + на комиссии
+        stop = max(stop, be) if d > 0 else min(stop, be)
+    if fav >= a.trail_start:
+        tr = best - d * a.trail_r * risk
+        stop = max(stop, tr) if d > 0 else min(stop, tr)
+    return stop
+
+
+def outcome(plan, h, l, c, start, hold, a):
+    """Исход сделки со входом по рынку на открытии бара start (≈ цена сигнала) и выходом по трейлингу.
+    В каждом баре сначала проверяем стоп (с тем стопом, что стоял до бара), потом двигаем стоп по максимуму бара.
+    Без движения: за a.stale_bars баров не дошли до +stale_r R — выходим по закрытию (режем убыток).
+    Комиссии — тейкер на вход и выход. -> (R, баров, итог) или None, если баров ещё не хватает."""
+    d, entry, stop, risk = plan["dir"], plan["entry"], plan["stop"], plan["risk"]
+    fee_r = 2 * a.taker_pct / 100 * entry / risk + a.slip_pct / 100 * entry / risk
+    best = entry
+    end = min(len(c), start + hold)
+    for k in range(start, end):
+        if (l[k] <= stop) if d > 0 else (h[k] >= stop):
+            why = "стоп" if (stop - entry) * d < 0 else ("безубыток" if (stop - entry) * d < 0.5 * risk else "трейлинг")
+            return (stop - entry) * d / risk - fee_r, k - start + 1, why
+        best = max(best, h[k]) if d > 0 else min(best, l[k])
+        stop = trail_stop(d, entry, risk, stop, best, a)
+        if k - start + 1 >= a.stale_bars and (best - entry) * d < a.stale_r * risk:
+            return (c[k] - entry) * d / risk - fee_r, k - start + 1, "без движения"
+    if end - start < hold:
         return None
-    return (c[end - 1] - entry) * d / risk - (maker_pct + taker_pct) * per, end - start, "время"
+    return (c[end - 1] - entry) * d / risk - fee_r, hold, "время"

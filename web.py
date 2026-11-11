@@ -103,6 +103,16 @@ def bavg(r):
     return "—" if r.get("best_avg") is None else f'{r["best_avg"]:+.3f}R'
 
 
+def best_r(o):
+    r0 = (o["entry"] - o.get("stop0", o["stop"])) * o["dir"]
+    return (o.get("best", o["entry"]) - o["entry"]) * o["dir"] / r0 if r0 > 0 else 0.0
+
+
+def stop_r(o):
+    r0 = (o["entry"] - o.get("stop0", o["stop"])) * o["dir"]
+    return (o["stop"] - o["entry"]) * o["dir"] / r0 if r0 > 0 else 0.0
+
+
 def tm(ts):
     return time.strftime("%d.%m %H:%M", time.gmtime(ts)) if ts else "—"
 
@@ -134,10 +144,10 @@ def render():
         kv = [("Режим", mode), ("Состояние", S["state"]),
               ("Баланс", f"{bal:.2f} $" if bal is not None else "—"),
               ("Сегодня (UTC)", f'{st.day["r"]:+.2f}R · {st.day["usd"]:+.2f}$ · {st.day["n"]} сд.'),
-              ("Всего сделок", f"{n} · тейков {wins / n:.0%}" if n else "0"),
+              ("Всего сделок", f"{n} · в плюсе {wins / n:.0%}" if n else "0"),
               ("Итог", f"{tot_r:+.2f}R · {tot_usd:+.2f}$" if n else "—"),
               ("Средняя сделка", f"{tot_r / n:+.2f}R" if n else "—"),
-              ("Риск / тейк", f"{a.risk_pct:g}% баланса · 1:{a.rr:g}"),
+              ("Риск / выход", f"{a.risk_pct:g}% баланса · трейлинг {a.trail_r:g}R с +{a.trail_start:g}R"),
               ("Сеть", ("ТОРГУЕТ" if br["active"] else "УЧИТСЯ") + " — " + br["why"])]
         if time.time() < st.pause_until:
             kv.append(("Пауза", "после серии стопов до " + tm(st.pause_until)))
@@ -150,12 +160,12 @@ def render():
         # открытые сделки
         rows = "".join(
             f'<tr><td>{escape(o["sym"])}</td><td class="{"pos" if o["dir"] > 0 else "neg"}">{"лонг" if o["dir"] > 0 else "шорт"}</td>'
-            f'<td>{escape(o["setup"])} {o.get("tf", 1)}м</td><td>{"ждёт заливки" if o.get("status") == "order" else "в позиции"}</td>'
-            f'<td>{o["entry"]:.6g}</td><td>{o["stop"]:.6g}</td><td>{o["tp"]:.6g}</td>'
+            f'<td>{escape(o["setup"])} {o.get("tf", 1)}м</td><td>{best_r(o):+.2f}R</td>'
+            f'<td>{o["entry"]:.6g}</td><td>{o["stop"]:.6g}</td><td>{stop_r(o):+.2f}R</td>'
             f'<td>{o.get("risk_usd", 0):.2f}$</td><td>{int((time.time() - o.get("opened", o.get("placed", time.time()))) / 60)} мин</td></tr>'
             for o in st.open)
-        body.append('<div class="panel"><h2>Открытые сделки и лимитки</h2><div class="scroll"><table><tr><th>Монета</th><th></th>'
-                    '<th>Сетап</th><th>Статус</th><th>Вход</th><th>Стоп</th><th>Тейк</th><th>Риск</th><th>Идёт</th></tr>'
+        body.append('<div class="panel"><h2>Открытые сделки (выход по трейлингу)</h2><div class="scroll"><table><tr><th>Монета</th><th></th>'
+                    '<th>Сетап</th><th>Лучшее</th><th>Вход</th><th>Стоп</th><th>Стоп сейчас</th><th>Риск</th><th>Идёт</th></tr>'
                     + (rows or '<tr><td colspan="9" class="muted">Нет</td></tr>') + "</table></div></div>")
         # исследование: какие сетапы реально в плюсе
         rs = br.get("research") or []
@@ -163,14 +173,15 @@ def render():
             f'<tr><td>{escape(r["setup"])}</td><td>{r["tf"]}м</td><td>{r["n"]:,}</td>'
             f'<td class="{"pos" if r["avg"] > 0 else "neg"}">{r["avg"]:+.3f}R</td>'
             f'<td>{bufs(r)}</td><td class="{"pos" if (r["best_avg"] or 0) > 0 else "neg"}">{bavg(r)}</td>'
-            f'<td>{r["tp"]:.0%}</td><td>{r["fill"]:.0%}</td><td class="{"pos" if r["on"] else "muted"}">{"торгую" if r["on"] else "нет"}</td></tr>'
+            f'<td>{r["tp"]:.0%}</td><td class="{"pos" if r["on"] else "muted"}">{"торгую" if r["on"] else "нет"}</td></tr>'
             for r in rs)
         body.append('<div class="panel"><h2>Какие сетапы в плюсе (реальная история, с комиссиями)</h2><div class="scroll"><table>'
                     '<tr><th>Сетап</th><th>ТФ</th><th>Сетапов</th><th>Средний R</th><th>Лучший запас стопа</th><th>R с ним</th>'
-                    '<th>Тейков</th><th>Заливка лимитки</th><th>Торговать</th></tr>'
-                    + (rows or '<tr><td colspan="9" class="muted">Посчитаю после первого обучения</td></tr>') + "</table></div>"
+                    '<th>Дошли до +1R</th><th>Торговать</th></tr>'
+                    + (rows or '<tr><td colspan="8" class="muted">Посчитаю после первого обучения</td></tr>') + "</table></div>"
                     f'<p class="muted small">Торгую сочетание, если на лучшем запасе стопа в среднем больше +{a.research_min_r:g}R '
-                    f'на {a.research_min}+ сетапах. «Средний R» — на каждый сигнал, включая не залитые лимитки (0R).</p></div>')
+                    f'на {a.research_min}+ сетапах. Вход по рынку, выход: стоп за структурой, безубыток при +{a.be_r:g}R, трейлинг {a.trail_r:g}R '
+                    f'с +{a.trail_start:g}R, нет +{a.stale_r:g}R за {a.stale_bars} баров — выход. Комиссии тейкера и проскальзывание учтены.</p></div>')
         # сигналы этой минуты
         rows = "".join(
             f'<tr><td>{escape(x["sym"])}</td><td>{escape(x["setup"])} {x.get("tf", 1)}м {"↑" if x["dir"] > 0 else "↓"}</td>'
@@ -202,7 +213,7 @@ def render():
             f'<div><span>{escape(k)}</span><b>{escape(str(x))}</b></div>' for k, x in [
                 ("Примеров в памяти", f'{br["samples"]:,} (своих сделок {br["real"]})'),
                 ("Ждут исхода", f"{len(b.pending):,}"),
-                (f"Онлайн {a.online_hours:g} ч: отобранные", f'{on["sel"]} · ' + (f'{on["sel_avg"]:+.2f}R, тейков {on["wins"]:.0%}' if on["sel"] else "—")),
+                (f"Онлайн {a.online_hours:g} ч: отобранные", f'{on["sel"]} · ' + (f'{on["sel_avg"]:+.2f}R, в плюсе {on["wins"]:.0%}' if on["sel"] else "—")),
                 (f"Онлайн {a.online_hours:g} ч: все сетапы", f'{on["n"]} · ' + (f'{on["all_avg"]:+.2f}R' if on["n"] else "—")),
                 ("Проверка на свежем куске", f'{v.get("sel", 0)} из {v.get("n", 0)} · {v.get("sel_avg", 0):+.2f}R против {v.get("base", 0):+.2f}R' if v else "—"),
                 ("Последнее переобучение", tm(br["last_train"]))]) + "</div></div>")

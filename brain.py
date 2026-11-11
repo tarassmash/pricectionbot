@@ -200,7 +200,7 @@ class Brain:
                             best = (float(b), v, int(mb.sum()))
                 filled = yy[yy != 0]
                 row = {"tf": tf, "setup": st, "n": n, "avg": float(yy.mean()),
-                       "tp": float((filled > 1).mean()) if len(filled) else 0.0,
+                       "tp": float((yy > 1).mean()),
                        "fill": float(len(filled) / n), "best_buf": best[0] if best else None,
                        "best_avg": best[1] if best else None}
                 row["on"] = bool(best and n >= self.a.research_min and best[1] > self.a.research_min_r)
@@ -212,7 +212,7 @@ class Brain:
             self.research, self.enabled = rows, enabled
         self.think("research", "Посчитала сетапы на истории", [
             f"{r['setup']} {r['tf']}м: {r['n']} сетапов, в среднем {r['avg']:+.2f}R, лучший запас стопа "
-            f"{r['best_buf']} ATR → {r['best_avg']:+.2f}R, тейков {r['tp']:.0%}, заливка {r['fill']:.0%}"
+            f"{r['best_buf']} ATR → {r['best_avg']:+.2f}R, до +1R дошли {r['tp']:.0%}"
             + (" — ТОРГУЮ" if r["on"] else " — не торгую") for r in rows if r["best_avg"] is not None])
 
     # ---------------------------------------------------------------- обучение
