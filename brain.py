@@ -10,6 +10,7 @@
 сетапы по факту в плюсе.
 """
 import json
+import logging
 import os
 import threading
 import time
@@ -160,6 +161,9 @@ class Brain:
 
     # ---------------------------------------------------------------- журнал
     def think(self, kind, title, lines=()):
+        if kind != "learn":                     # «учусь на ходу» каждую минуту — только на странице
+            logging.getLogger("pa").info("Сеть [%s]: %s%s", kind, title,
+                                         ("; " + "; ".join(l for l in lines if l)) if lines else "")
         self.thoughts.append({"time": time.time(), "kind": kind, "title": title, "lines": list(lines)})
         self.thoughts = self.thoughts[-60:]
 
