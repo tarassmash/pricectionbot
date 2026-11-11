@@ -65,6 +65,9 @@ def parse_args():
     p.add_argument("--min-room", type=float, default=1.2, help="до встречного уровня минимум X R")
     # сеть
     p.add_argument("--min-edge", type=float, default=0.15, help="входить, если сеть ждёт ≥ X R")
+    p.add_argument("--rule-trade", type=int, default=1,
+                   help="1 — пока сеть учится, торговать сетапы из таблицы «в плюсе» (сеть только отсекает минус)")
+    p.add_argument("--veto-r", type=float, default=0.0, help="по таблице: не входить, если сеть ждёт меньше X R")
     p.add_argument("--history-days", type=float, default=3, help="история свечей для первого обучения, дней")
     p.add_argument("--memory-days", type=float, default=7)
     p.add_argument("--max-samples", type=int, default=150_000)
@@ -422,8 +425,14 @@ class Bot:
         st = self.st
         st.roll_day()
         for (sym, tf, setup, d), p in sorted(best.items(), key=lambda x: -x[1]["pred"]):
-            take = sym in self.universe and p["pred"] >= self.a.min_edge
-            note = ""
+            # сеть в форме — входим, если она ждёт ≥ --min-edge; учится — входим по таблице сетапов,
+            # а сеть только отсекает то, где ждёт минус (--veto-r)
+            rule = (not ok) and self.a.rule_trade and enabled is not None
+            edge = self.a.min_edge if ok else self.a.veto_r
+            take = sym in self.universe and (ok or rule) and p["pred"] >= edge
+            note = "" if (ok or rule or sym not in self.universe) else "сеть учится"
+            if sym in self.universe and (ok or rule) and p["pred"] < edge:
+                note = "сеть ждёт минус" if rule else "слабый"
             if take and enabled is not None:
                 if (tf, setup) not in enabled:
                     take, note = False, "этот сетап/ТФ в минусе на истории"
@@ -431,14 +440,12 @@ class Bot:
                     # сеть выбрала другой запас стопа — берём тот, что в плюсе на истории
                     alt = [q for s_, q in fresh if s_ == sym and q["tf"] == tf and q["setup"] == setup
                            and q["dir"] == d and abs(q["buf"] - enabled[(tf, setup)]) < 1e-6 and q.get("pred") is not None]
-                    if alt and alt[0]["pred"] >= self.a.min_edge:
+                    if alt and alt[0]["pred"] >= edge:
                         p = alt[0]
                     else:
                         take, note = False, f"с запасом {enabled[(tf, setup)]:g} ATR сеть ждёт мало"
             if not take:
                 pass
-            elif not ok:
-                take, note = False, "сеть учится"
             elif any(o["sym"] == sym for o in st.open):
                 take, note = False, "уже в сделке"
             elif len(st.open) >= self.a.max_open:
